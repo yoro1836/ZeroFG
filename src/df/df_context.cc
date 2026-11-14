@@ -193,11 +193,45 @@ class DfContext final : public AlgorithmContext, public DenseFlowSource {
       InvalidatePyramidCache();
       return Status::kInvalidArgument;
     }
-    if (std::abs(phase - 0.5f) > 0.0001f) {
+    // Any phase in (0, 2): inside the pair interpolates, past B extrapolates (the flow carried on).
+    if (!(phase > 0.0f && phase < 2.0f)) {
       InvalidatePyramidCache();
       return Status::kUnsupported;
     }
-    return Record(command_buffer, previous, current, &output);
+    phase_ = phase;
+    // The same pair again (another phase of it): the flow is already there, only the picture is recorded.
+    if (flow_pair_valid_ && previous.sequence != 0 && current.sequence != 0 && previous.sequence == flow_prev_seq_ &&
+        current.sequence == flow_cur_seq_ && previous.image == flow_prev_image_ && current.image == flow_cur_image_) {
+      return RecordReusedFlow(command_buffer, previous, current, output);
+    }
+    flow_pair_valid_ = false;
+    const Status status = Record(command_buffer, previous, current, &output);
+    if (status == Status::kSuccess && previous.sequence != 0 && current.sequence != 0 && ResolveRect(previous).x == 0 &&
+        ResolveRect(previous).y == 0 && previous.width == width_ && previous.height == height_) {
+      flow_pair_valid_ = true;
+      flow_prev_seq_ = previous.sequence;
+      flow_cur_seq_ = current.sequence;
+      flow_prev_image_ = previous.image;
+      flow_cur_image_ = current.image;
+    }
+    return status;
+  }
+
+  // Another phase of the pair the last Record solved: the final pass and the cleanup only, on the next set copies.
+  Status RecordReusedFlow(VkCommandBuffer command_buffer, const Image& previous, const Image& current, const Image& output) {
+    const bool write_direct = direct_output_ && (output.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+    if (!write_direct && (output.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0) return Status::kInvalidArgument;
+    slot_ = (slot_ + 1) % frame_contexts_;
+    BindSampled(Stage::kFinal, Copy(Stage::kFinal, 0), 13, previous.view, previous.layout);
+    BindSampled(Stage::kFinal, Copy(Stage::kFinal, 0), 14, current.view, current.layout);
+    BindStorageImage(Stage::kClean, Copy(Stage::kClean, 0), 20, write_direct ? output.view : fallback_output_.view());
+    BindStorageImage(Stage::kFinal, Copy(Stage::kFinal, 0), 20, write_direct ? output.view : fallback_output_.view());
+    MemoryBarrier(command_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    RecordOutput(command_buffer, &output, write_direct);
+    return Status::kSuccess;
   }
 
   // The frame, or with no output (RC6) only the flow.
@@ -290,6 +324,7 @@ class DfContext final : public AlgorithmContext, public DenseFlowSource {
   // neither omit that store nor skip a cleanup summary its shader expects.
   int ProductOpts() const { return product_ ? kProductOpts : 0; }
   void InvalidatePyramidCache() {
+    flow_pair_valid_ = false;
     pyramid_valid_ = pyramid_reuse_ = false;
     pyramid_a_ = 0;
     pyramid_b_ = 1;
@@ -740,6 +775,12 @@ class DfContext final : public AlgorithmContext, public DenseFlowSource {
 
     have_last_ = true;
     if (!output_or_null) return;  // RC6: only the flow
+    RecordOutput(cmd, output_or_null, write_direct);
+  }
+
+  // The picture from the solved flow at phase_: the cut test, the final pass and the cleanup.
+  void RecordOutput(VkCommandBuffer cmd, const Image* output_or_null, bool write_direct) {
+    const VkPipelineStageFlags2 kCompute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     const Image& output = *output_or_null;
     // The output (or the internal image that is blitted to it): the final pass writes it, the cleanup goes back over the tiles with a doubt within reach.
     VkImage target = write_direct ? output.image : fallback_output_.image();
@@ -778,6 +819,7 @@ class DfContext final : public AlgorithmContext, public DenseFlowSource {
     fin.b[0] = int32_t(F.w); fin.b[1] = int32_t(F.h); fin.b[2] = F.flow0; fin.b[3] = F.flow1;
     fin.c[1] = kStillBar;
     fin.c[3] = 1 | 2;
+    fin.c[2] = int32_t(phase_ * 65536.0f + 0.5f);  // 0.5 = 32768; 0 keeps the shader's midpoint
     fin.p[0] = kSigma; fin.p[1] = kDisagreement; fin.p[2] = product_ ? kLoopAt640 * float(width_) / 640.0f : kLoop * float(picture_scale); fin.p[3] = 1.0f;
     Dispatch(cmd, Stage::kFinal, 0, &fin, sizeof(fin), Groups(PictureW(), 8), Groups(PictureH(), 8));
     ComputeBarrier(cmd);
@@ -857,6 +899,11 @@ class DfContext final : public AlgorithmContext, public DenseFlowSource {
   Capabilities capabilities_;
   Backend backend_;
   uint32_t finest_ = kFinest;  // the finest solved level (RC6 proposals: 2)
+  float phase_ = 0.5f;
+  // The pair whose flow the buffers hold, for further phases of it.
+  bool flow_pair_valid_ = false;
+  uint64_t flow_prev_seq_ = 0, flow_cur_seq_ = 0;
+  VkImage flow_prev_image_ = VK_NULL_HANDLE, flow_cur_image_ = VK_NULL_HANDLE;
   bool starts_ = false;        // the search's other starts and the agreement test: RC5 and RC7
   uint32_t picture_w_ = 0, picture_h_ = 0;  // the picture's size when it is not the flow's Reals' size (RC7)
   bool product_ = false;       // RC5 itself: the flow's grid and the loop's limit follow the resolution

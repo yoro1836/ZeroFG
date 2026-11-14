@@ -14,13 +14,16 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 const vec2 CAND[9] = vec2[9](vec2(8, 0), vec2(-8, 0), vec2(0, 8), vec2(0, -8), vec2(16, 0), vec2(-16, 0), vec2(0, 16), vec2(0, -16), vec2(0, 0));
 
+// The phase (pc.c.z / 65536, 0 = the midpoint): A is sampled KA times the half motion t0 away, B KB times the other way. 0.5 gives 1 and 1.
+float KA = 1.0, KB = 1.0;
+
 // The A/B luma disagreement of the midpoint motion t at (x, y) over a plus of five taps two pixels apart (0..255 per tap).
 float sym_sad5(vec2 t, float x, float y) {
   const vec3 L = vec3(0.299, 0.587, 0.114);
   float s = 0.0;
   for (int k = 0; k < 5; ++k) {
     vec2 d = k == 0 ? vec2(0.0) : vec2(k == 1 ? 2.0 : k == 2 ? -2.0 : 0.0, k == 3 ? 2.0 : k == 4 ? -2.0 : 0.0);
-    s += abs(dot(real_bil(0, x + d.x + t.x, y + d.y + t.y) - real_bil(1, x + d.x - t.x, y + d.y - t.y), L));
+    s += abs(dot(real_bil(0, x + d.x + KA * t.x, y + d.y + KA * t.y) - real_bil(1, x + d.x - KB * t.x, y + d.y - KB * t.y), L));
   }
   return 255.0 * s;
 }
@@ -41,14 +44,17 @@ void main() {
     return;
   }
   int sc = pc.a.w, wf = pc.b.x, hf = pc.b.y;
+  float ph = pc.c.z == 0 ? 0.5 : float(pc.c.z) / 65536.0;
+  KA = 2.0 * ph;
+  KB = 2.0 * (1.0 - ph);
   float px = float(x), py = float(y);
   vec2 pa, pb;
   float ea, eb, dis;
   vec3 ca, cb;
   if (tx) {
     vec2 t0 = 0.25 * (full_flow_t(1, sc, px, py) - full_flow_t(0, sc, px, py));
-    pa = vec2(px, py) + t0;
-    pb = vec2(px, py) - t0;
+    pa = vec2(px, py) + KA * t0;
+    pb = vec2(px, py) - KB * t0;
     vec2 fa = full_flow_t(0, sc, pa.x, pa.y);
     vec2 fb = full_flow_t(1, sc, pb.x, pb.y);
     if ((DF_OPTS & 64) != 0) {
@@ -80,8 +86,8 @@ void main() {
       }
       if (bt != t0) {
         t0 = bt;
-        pa = vec2(px, py) + t0;
-        pb = vec2(px, py) - t0;
+        pa = vec2(px, py) + KA * t0;
+        pb = vec2(px, py) - KB * t0;
         fa = full_flow_t(0, sc, pa.x, pa.y);
         fb = full_flow_t(1, sc, pb.x, pb.y);
         ea = length(fa + full_flow_t(1, sc, pa.x + fa.x, pa.y + fa.y));
@@ -144,6 +150,9 @@ void main() {
   float s2 = pc.p.x * pc.p.x;
   float e0 = (DF_OPTS & 8) != 0 ? min(ea, eb) : 0.0;  // bit 3: the loop errors relative to the better side (both loops open: not a 50/50 blend)
   float wa = exp(-(ea - e0) * (ea - e0) / s2) + 1e-3, wb = exp(-(eb - e0) * (eb - e0) / s2) + 1e-3;
+  // Off the midpoint the nearer Real counts more (equal at 0.5, so the midpoint is unchanged).
+  wa /= abs(ph) + 0.1;
+  wb /= abs(1.0 - ph) + 0.1;
   vec3 bw = (wa * ca + wb * cb) / (wa + wb);
   if ((DF_OPTS & 16) != 0) {  // bit 4: where the two colours disagree, one side only (the better loop; bit 5: B only when its loop is 0.5 px better)
     bool use_b = (DF_OPTS & 32) != 0 ? eb < ea - 0.5 : eb < ea;
